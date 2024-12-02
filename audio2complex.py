@@ -15,27 +15,29 @@ def set_seeds(seed):
     return g
 
 class AudioAutoencoder(nn.Module):
-    def __init__(self, num_vertices, num_triangles=500, num_tetra=500):
+    def __init__(self, num_vertices, num_bands=16, decoder_hidden_dim=256):
         super(AudioAutoencoder, self).__init__()
         
-        self.encoder = AudioEncoder(num_vertices, num_triangles, num_tetra).to('cpu')
-        self.decoder = AudioDecoder()
+        self.encoder = AudioEncoder(num_vertices, num_bands=num_bands, embedding_dim=decoder_hidden_dim)
+        self.decoder = AudioDecoder(decoder_hidden_dim=decoder_hidden_dim)
         self.test = False
         # self.encoder_device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        self.encoder_device = torch.device("cpu")
-        self.sccn_device = torch.device("cpu")
-        self.pqmf = PQMF(100, 16, polyphase=True)
+        # self.encoder_device = torch.device("cpu")
+        # self.sccn_device = torch.device("cpu")
+        self.pqmf = PQMF(100, num_bands, polyphase=True)
         self.seed = 511990
         self.sc = None
 
     def forward(self, x):
         x = self.pqmf.forward(x)
-        x = x.to(self.encoder_device).squeeze(0)
-        decoder_inputs, loss_component, sc = self.encoder(x)
+        x = x.squeeze(0)
+        desired_length = x.shape[1]
+        # x = x.to(self.encoder_device).squeeze(0)
+        feature_embeddings, complex_matrices, loss_component = self.encoder(x)
 
-        self.sc = sc
-        output = self.decoder(**decoder_inputs)
-        output = output.to(self.sccn_device)
+        # self.sc = sc
+        output = self.decoder(feature_embeddings, complex_matrices, desired_length)
+        # output = output.to(self.sccn_device)
         output = self.pqmf.inverse(output)
         # output = output.to(self.encoder_device)
 

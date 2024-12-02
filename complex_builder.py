@@ -8,14 +8,10 @@ from rectifier import ConstraintMatrices
 @dataclass
 class SparseSimplicialMatrices:
     # Adjacency matrices
-    vertex_adjacency: SparseTensor  # VxV: vertices connected by edges
-    edge_adjacency: SparseTensor    # ExE: edges connected by triangles
-    triangle_adjacency: SparseTensor # TxT: triangles connected by tetrahedra
+    adjacencies: dict[int, SparseTensor]
     
     # Incidence matrices
-    vertex_edge_incidence: SparseTensor    # VxE: vertices in each edge
-    edge_triangle_incidence: SparseTensor   # ExT: edges in each triangle
-    triangle_tetra_incidence: SparseTensor  # TxTT: triangles in each tetrahedron
+    incidences: dict[int, SparseTensor]
 
 def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices) -> SparseSimplicialMatrices:
     """
@@ -73,6 +69,18 @@ def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices) -
         sparse_sizes=(n_triangles, n_tetra)
     )
     
+    # Build tetrahedra adjacency matrix (tetrahedra connected by shared triangles)
+    tetrahedra_adjacency = triangle_tetra_incidence.t() @ triangle_tetra_incidence
+    # Remove diagonal
+    tetra_adj_indices = tetrahedra_adjacency.coo()[:2]
+    mask = tetra_adj_indices[0] != tetra_adj_indices[1]
+    tetrahedra_adjacency = SparseTensor(
+        row=tetra_adj_indices[0][mask],
+        col=tetra_adj_indices[1][mask],
+        value=tetrahedra_adjacency.storage.value()[mask],
+        sparse_sizes=(n_tetra, n_tetra)
+    )
+    
     # Build edge adjacency matrix (edges connected by triangles)
     # Using sparse matrix multiplication
     edge_adjacency = edge_triangle_incidence @ edge_triangle_incidence.t()
@@ -99,12 +107,17 @@ def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices) -
     )
     
     return SparseSimplicialMatrices(
-        vertex_adjacency=vertex_adjacency,
-        edge_adjacency=edge_adjacency,
-        triangle_adjacency=triangle_adjacency,
-        vertex_edge_incidence=vertex_edge_incidence,
-        edge_triangle_incidence=edge_triangle_incidence,
-        triangle_tetra_incidence=triangle_tetra_incidence
+        adjacencies={
+            0: vertex_adjacency,
+            1: edge_adjacency,
+            2: triangle_adjacency,
+            3: tetrahedra_adjacency
+        },
+        incidences={
+            1: vertex_edge_incidence,
+            2: edge_triangle_incidence,
+            3: triangle_tetra_incidence
+        }
     )
 
 def verify_sparse_matrices(matrices: SparseSimplicialMatrices, probs: RectifiedProbs, constraints: ConstraintMatrices):
@@ -118,6 +131,7 @@ def verify_sparse_matrices(matrices: SparseSimplicialMatrices, probs: RectifiedP
     print(f"Vertex adjacency: {matrices.vertex_adjacency.nnz()}")
     print(f"Edge adjacency: {matrices.edge_adjacency.nnz()}")
     print(f"Triangle adjacency: {matrices.triangle_adjacency.nnz()}")
+    print(f"Tetrahedra adjacency: {matrices.tetrahedra_adjacency.nnz()}")
     
     print("\nChecking incidence matrices:")
     print(f"Vertex-edge incidence: {matrices.vertex_edge_incidence.nnz()}")
@@ -131,3 +145,7 @@ def verify_sparse_matrices(matrices: SparseSimplicialMatrices, probs: RectifiedP
         
         print("\nSample of edge adjacency (dense):")
         print(matrices.edge_adjacency.to_dense())
+
+
+if __name__ == "__main__":
+    verify_sparse_matrices(build_sparse_matrices(RectifiedProbs.random(10), ConstraintMatrices.random(10)), RectifiedProbs.random(10), ConstraintMatrices.random(10))

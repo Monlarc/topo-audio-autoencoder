@@ -10,7 +10,8 @@ import numpy as np
 from itertools import combinations
 import math
 import random
-from rectifier import ConstraintMatrices, enforce_constraints
+from rectifier import ConstraintMatrices, enforce_constraints, RectifiedProbs
+from complex_builder import SparseSimplicialMatrices, build_sparse_matrices
 
 def set_seeds(seed):
     torch.manual_seed(seed)
@@ -56,8 +57,8 @@ class HardConcrete(nn.Module):
         concrete = torch.sigmoid(scores / self.temp)
         
         # Ensure zeta > gamma for valid stretching
-        gamma = self.gamma
-        zeta = self.zeta + (1.2 - self.gamma)  # Ensures zeta > gamma by at least 1.2
+        gamma = -F.softplus(-self.gamma)
+        zeta = gamma + F.softplus(self.zeta)  # Ensures zeta > gamma by at least 1.2
         
         stretched = gamma + (zeta - gamma) * concrete
         clamped = torch.clamp(stretched, 0, 1)
@@ -81,7 +82,7 @@ class FrequencyBandModule(nn.Module):
     
 
 class AudioEncoder(nn.Module):
-    def __init__(self, num_vertices, num_bands=16):
+    def __init__(self, num_vertices, num_bands=16, embedding_dim=128):
         super(AudioEncoder, self).__init__()
         self.num_vertices = num_vertices
         self.num_edges = math.comb(self.num_vertices, 2)
@@ -90,6 +91,15 @@ class AudioEncoder(nn.Module):
         self.total_simplices = self.num_vertices + self.num_edges + self.num_triangles + self.num_tetra
         # self.sc = SimplicialComplex()
         self.seed = 511990
+        self.embedding_dim = embedding_dim
+
+        # Vertex embeddings
+        self.vertex_embeddings = nn.Embedding(num_vertices, embedding_dim)
+
+        # Linear layers for projecting embeddings
+        self.edge_projection = nn.Linear(2 * embedding_dim, embedding_dim)
+        self.triangle_projection = nn.Linear(3 * embedding_dim, embedding_dim)
+        self.tetra_projection = nn.Linear(4 * embedding_dim, embedding_dim)
 
         # Create constraint matrices for rectification
         self.constraints = ConstraintMatrices.create(num_vertices)
@@ -174,6 +184,47 @@ class AudioEncoder(nn.Module):
             self.constraints
         )
 
+        # Apply binary entropy loss to push probabilities towards 0 or 1
+        # Calculate binary entropy loss for each type of simplex using list comprehension
+        binary_entropy = sum(
+            -(p * torch.log(p + 1e-10) + (1 - p) * torch.log(1 - p + 1e-10))
+            for p in [rectified.vertices, rectified.edges, rectified.triangles, rectified.tetra]
+        )
+        entropy_loss = binary_entropy.mean()
+
+        complex_matrices = build_sparse_matrices(rectified, self.constraints)
+
+        # Create vertex embeddings
+
+        vertex_indices = torch.arange(self.num_vertices, device=x.device)
+        # vertex_indices = vertex_probs.nonzero().squeeze(1)
+        vertex_embeds = self.vertex_embeddings(vertex_indices)
+
+        # Use pre-computed indices from constraints
+        edge_indices = self.constraints.indices.edges
+        triangle_indices = self.constraints.indices.triangles
+        tetra_indices = self.constraints.indices.tetra
+
+        # Project edge embeddings
+        edge_embeds = self.edge_projection(vertex_embeds[edge_indices].view(-1, 2 * self.embedding_dim))
+
+        # Project triangle embeddings
+        triangle_embeds = self.triangle_projection(edge_embeds[triangle_indices].view(-1, 3 * self.embedding_dim))
+
+        # Project tetrahedron embeddings
+        tetra_embeds = self.tetra_projection(triangle_embeds[tetra_indices].view(-1, 4 * self.embedding_dim))
+
+        # Concatenate all embeddings
+        embeddings = {
+            0 : vertex_embeds, 
+            1 : edge_embeds, 
+            2 : triangle_embeds, 
+            3 : tetra_embeds
+        }
+
+        # Return embeddings as part of the output
+        return embeddings, complex_matrices, entropy_loss
+
         # vertex_logits = logits[:, :self.num_vertices]
         # edge_logits = logits[:, self.num_vertices:self.num_vertices + self.num_edges]
         # triangle_logits = logits[:, self.num_vertices + self.num_edges:self.num_vertices + self.num_edges + self.num_triangles]
@@ -185,7 +236,7 @@ class AudioEncoder(nn.Module):
         # triangle_probs = self.triangle_concrete(triangle_logits)
         # tetra_probs = self.tetra_concrete(tetra_logits)
         
-        return rectified.vertices, rectified.edges, rectified.triangles, rectified.tetra
+        # return rectified.vertices, rectified.edges, rectified.triangles, rectified.tetra
     
 
     def count_parameters(self):
@@ -205,13 +256,14 @@ class AudioEncoder(nn.Module):
         mlp_params = sum(p.numel() for p in self.mlp.parameters())
         
         # Hard Concrete params
-        concrete_params = sum(sum(p.numel() for p in module.parameters()) 
-                        for module in [
-                            self.vertex_concrete,
-                            self.edge_concrete,
-                            self.triangle_concrete,
-                            self.tetra_concrete
-                        ])
+        # concrete_params = sum(sum(p.numel() for p in module.parameters()) 
+        #                 for module in [
+        #                     self.vertex_concrete,
+        #                     self.edge_concrete,
+        #                     self.triangle_concrete,
+        #                     self.tetra_concrete
+        #                 ])
+        concrete_params = sum(p.numel() for p in self.concrete.parameters())
         
         print("\nParameter Count Breakdown:")
         print(f"Frequency Band Processors: {total_band_params:,} params")
@@ -287,7 +339,64 @@ def test_hard_concrete():
     print(f"In (0,1): {middle:.3f}")
     print(f"Mean: {out.mean():.3f}")
 
+def test_simple_complex():
+    # Define 6 vertices
+    n_vertices = 6
+    
+    # Create binary probabilities for a simple complex
+    vertex_probs = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.float32)
+    edge_probs = torch.tensor([1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.float32)  # 15 edges for 6 vertices
+    triangle_probs = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.float32)  # 20 triangles
+    tetra_probs = torch.tensor([1], dtype=torch.float32)  # At least one tetrahedron
+
+    # Create constraint matrices
+    matrices = ConstraintMatrices.create(n_vertices)
+
+    # Create rectified probabilities
+    rectified_probs = enforce_constraints(
+        vertex_probs=vertex_probs,
+        edge_probs=edge_probs,
+        triangle_probs=triangle_probs,
+        tetra_probs=tetra_probs,
+        matrices=matrices
+    )
+
+    print("rectified_probs.vertices")
+    print(rectified_probs.vertices)
+    print("rectified_probs.edges")
+    print(rectified_probs.edges)
+    print("rectified_probs.triangles")
+    print(rectified_probs.triangles)
+    print("rectified_probs.tetra")
+    print(rectified_probs.tetra)
+
+    # Build sparse matrices
+    sparse_matrices = build_sparse_matrices(rectified_probs, matrices)
+
+    # Print adjacency and incidence matrices
+    print("Vertex Adjacency Matrix:")
+    print(sparse_matrices.adjacencies[0].to_dense())
+
+    print("\nEdge Adjacency Matrix:")
+    print(sparse_matrices.adjacencies[1].to_dense())
+
+    print("\nTriangle Adjacency Matrix:")
+    print(sparse_matrices.adjacencies[2].to_dense())
+
+    print("\nTetrahedra Adjacency Matrix:")
+    print(sparse_matrices.adjacencies[3].to_dense())
+
+    print("\nVertex-Edge Incidence Matrix:")
+    print(sparse_matrices.incidences[1].to_dense())
+
+    print("\nEdge-Triangle Incidence Matrix:")
+    print(sparse_matrices.incidences[2].to_dense())
+
+    print("\nTriangle-Tetra Incidence Matrix:")
+    print(sparse_matrices.incidences[3].to_dense())
+
 if __name__ == "__main__":
-    # model = AudioEncoder(num_vertices=10)
+    # model = AudioEncoder(num_vertices=20)
     # model.count_parameters()
-    test_hard_concrete()
+    test_simple_complex()
+    # test_hard_concrete()
