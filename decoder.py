@@ -1,9 +1,12 @@
-from utils import PriorityQueue
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from TopoModelX.topomodelx.nn.simplicial.sccn import SCCN
 import random
+torch.autograd.set_detect_anomaly(True)
+from torch.profiler import profile, record_function, ProfilerActivity
+import time
+from custom_sccn import GradientSCCN, JumpingKnowledgeSCCN
 
 def set_seeds(seed):
     torch.manual_seed(seed)
@@ -14,49 +17,148 @@ def set_seeds(seed):
     return g
 
 class AudioDecoder(nn.Module):
-    def __init__(self, decoder_hidden_dim=256):
-        super(AudioDecoder, self).__init__()
-        # self.mps_device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        # self.mps_device = torch.device("cpu")
-        # self.sccn_device = torch.device('cpu')
-        self.sccn = SCCN(channels=decoder_hidden_dim, max_rank=3, n_layers=6, update_func='sigmoid')
-        self.transformer2 = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=decoder_hidden_dim, nhead=8, dim_feedforward=512, batch_first=True),
-            num_layers=2
+    def __init__(self, 
+                 sccn_hidden_dim=64,
+                 initial_sequence_length=250,
+                 output_channels=16):
+        super().__init__()
+        self.sccn = JumpingKnowledgeSCCN(
+            channels=sccn_hidden_dim, 
+            max_rank=3, 
+            n_layers=4, 
+            update_func='gelu'
         )
-
-        self.out_conv1 = nn.Conv1d(in_channels=decoder_hidden_dim, out_channels=64, kernel_size=7, stride=1, padding='same')
-        self.out_conv2 = nn.Conv1d(in_channels=64, out_channels=16, kernel_size=31, stride=1, padding='same')
-        self.conv_tranpose = nn.ConvTranspose1d(in_channels=64, out_channels=16, kernel_size=4, stride=4)
-        self.seed = 511990
+        self.initial_sequence_length = initial_sequence_length
+        
+        # Scale down initial query values
+        self.query_sequence = nn.Parameter(
+            torch.randn(1, initial_sequence_length, sccn_hidden_dim) * 0.02
+        )
+        
+        # Add layer norm before and after attention
+        self.pre_attention_norm = nn.LayerNorm(sccn_hidden_dim)
+        self.post_attention_norm = nn.LayerNorm(sccn_hidden_dim)
+        
+        # Cross-attention with gradient scaling
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=sccn_hidden_dim,
+            num_heads=16,
+            batch_first=True,
+            dropout=0.1  # Add some dropout
+        )
+        
+        # Scale attention outputs to help with gradient flow
+        self.attention_scale = nn.Parameter(torch.ones(1))
+        
+        # Add pre-scaling for queries and keys
+        self.query_proj = nn.Linear(sccn_hidden_dim, sccn_hidden_dim)
+        self.key_proj = nn.Linear(sccn_hidden_dim, sccn_hidden_dim)
+        self.value_proj = nn.Linear(sccn_hidden_dim, sccn_hidden_dim)
+        
+        # Modify upsampling blocks for better gradient flow
+        self.upsample_blocks = nn.ModuleList([
+            # 250 -> 500
+            nn.Sequential(
+                nn.ConvTranspose1d(sccn_hidden_dim, sccn_hidden_dim, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim),  # Group norm instead of batch norm
+                nn.GELU(),  # GELU instead of LeakyReLU
+                nn.Conv1d(sccn_hidden_dim, sccn_hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim),
+                nn.GELU(),
+            ),
+            # 500 -> 1000
+            nn.Sequential(
+                nn.ConvTranspose1d(sccn_hidden_dim, sccn_hidden_dim // 2, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim // 2),
+                nn.GELU(),
+                nn.Conv1d(sccn_hidden_dim // 2, sccn_hidden_dim // 2, kernel_size=3, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim // 2),
+                nn.GELU(),
+            ),
+            # 1000 -> 2000
+            nn.Sequential(
+                nn.ConvTranspose1d(sccn_hidden_dim // 2, sccn_hidden_dim // 4, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim // 4),
+                nn.GELU(),
+                nn.Conv1d(sccn_hidden_dim // 4, sccn_hidden_dim // 4, kernel_size=3, padding=1),
+                nn.GroupNorm(8, sccn_hidden_dim // 4),
+                nn.GELU(),
+            ),
+            # 2000 -> 4000
+            nn.Sequential(
+                nn.ConvTranspose1d(sccn_hidden_dim // 4, output_channels, kernel_size=4, stride=2, padding=1),
+                nn.GroupNorm(8, output_channels),
+                nn.GELU(),
+                nn.Conv1d(output_channels, output_channels, kernel_size=3, padding=1),
+            )
+        ])
+        
+        # Add residual projections for each upsampling block
+        self.residual_projections = nn.ModuleList([
+            nn.Conv1d(sccn_hidden_dim, sccn_hidden_dim, kernel_size=1),
+            nn.Conv1d(sccn_hidden_dim, sccn_hidden_dim // 2, kernel_size=1),
+            nn.Conv1d(sccn_hidden_dim // 2, sccn_hidden_dim // 4, kernel_size=1),
+            nn.Conv1d(sccn_hidden_dim // 4, output_channels, kernel_size=1)
+        ])
+        
+        # Add scaling factors for residual connections
+        self.residual_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(1) * 0.1) for _ in range(4)
+        ])
+        
+        # Initialize weights with smaller values
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Conv1d, nn.ConvTranspose1d)):
+            nn.init.xavier_uniform_(m.weight, gain=0.1)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def forward(self, decoder_input_features, complex_matrices, desired_length):
-        # for tensors in decoder_input_features.values():
-        #     tensors.to(self.sccn_device)
+        # Process through SCCN
         output = self.sccn(decoder_input_features, complex_matrices.incidences, complex_matrices.adjacencies)
-
-        features = [feature.to_dense() for feature in output.values()]
         
-        decoder_tranformer_input = torch.cat(tuple(features), dim=0).unsqueeze(0)
-
-        output_sequence = []
-        output_size = 0
-        while output_size < desired_length:
-
-            output = self.transformer2(decoder_tranformer_input)  # Assuming `memory` is handled inside if needed
-            output_sequence.append(output)
-            output_size  += output.shape[1]
+        # Get features from all ranks and concatenate
+        all_features = []
+        for rank in range(4):  # 0 to 3
+            rank_features = output[f'rank_{rank}'].to_dense()
+            all_features.append(rank_features)
+        
+        # Concatenate along feature dimension
+        combined_features = torch.cat(all_features, dim=0)  # [total_simplices, hidden_dim]
+        
+        # Add batch dimension to active features
+        combined_features = combined_features.unsqueeze(0)  # [1, total_simplices, hidden_dim]
+        
+        # Normalize inputs
+        combined_features = self.pre_attention_norm(combined_features)
+        query = self.query_proj(self.pre_attention_norm(self.query_sequence))
+        keys = self.key_proj(self.pre_attention_norm(combined_features))
+        values = self.value_proj(combined_features)
+        
+        # Scale attention outputs
+        attn_out, _ = self.cross_attention(
+            query=query,
+            key=keys,
+            value=values
+        )
+        attn_out = attn_out * self.attention_scale
+        
+        # Gradient-friendly residual connection
+        x = query + F.gelu(attn_out)  # Using GELU instead of direct addition
+        x = self.post_attention_norm(x)
+        
+        # Prepare for convolutional layers
+        x = x.transpose(1, 2)
+        
+        # Progressive upsampling with scaled residual connections
+        for block, proj, scale in zip(self.upsample_blocks, self.residual_projections, self.residual_scales):
+            identity = F.interpolate(x, scale_factor=2, mode='linear', align_corners=False)
+            identity = proj(identity) * scale  # Scale residual connection
+            x = block(x)
+            x = x + identity
             
-            next_input = output[:, -1:, :]  # Take last timestep's output
-            decoder_tranformer_input = torch.cat((decoder_tranformer_input, next_input), dim=1)
+        return x
 
-        output = torch.cat(output_sequence, dim=1)
-        output = output[:,:desired_length,:].squeeze().transpose(0,1)
-        output = self.out_conv1(output)
-        output = F.relu(output)
-        # output = self.out_conv2(output)
-        output = self.conv_tranpose(output).unsqueeze(0)
-
-        return output
     
-

@@ -23,6 +23,6 @@ class AutoencoderLoss(AudioDistanceV1):
     def forward(self, x: torch.Tensor, y: torch.Tensor, binary_entropy_loss):
         result = super().forward(x, y)
 
-        result = result['spectral_distance'] + self.binary_entropy_penalty * binary_entropy_loss
+        loss = result['spectral_distance'] + self.binary_entropy_penalty * binary_entropy_loss
 
-        return result
+        return loss

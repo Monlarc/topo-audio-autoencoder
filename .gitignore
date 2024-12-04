@@ -1,6 +1,15 @@
 # Ignore Python cache directories
 __pycache__/
 
+# Ignore checkpoint files
+checkpoints/
+
+# Ignore audio samples
+AudioTensors/
+
+# Ignore TopoModelX
+TopoModelX/
+
 # Other rules...
 *.pyc
 *.pyo

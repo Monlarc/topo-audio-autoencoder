@@ -2,6 +2,7 @@ import torch
 import itertools
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
+torch.autograd.set_detect_anomaly(True)
 
 @dataclass
 class SimplexIndices:
@@ -84,29 +85,36 @@ def enforce_constraints(
     """
     # Compute vertex-constrained edge probabilities
     vertex_pairs = vertex_probs[matrices.indices.edges]
-    zero_mask = (vertex_pairs == 0).any(dim=1)  # If either vertex is 0, the edge should be 0
+    zero_mask = (vertex_pairs == 0).any(dim=1)
     vertex_pairs_log_mean = torch.exp(
         torch.log(vertex_pairs + eps).sum(dim=1) / 2
     )
-    vertex_pairs_log_mean[zero_mask] = 0
+    # Zero out probabilities while maintaining gradients
+    vertex_pairs_log_mean = torch.where(zero_mask, 
+                                      vertex_pairs_log_mean - vertex_pairs_log_mean,
+                                      vertex_pairs_log_mean)
     rectified_edge_probs = torch.minimum(edge_probs, vertex_pairs_log_mean)
     
     # Rectify triangle probabilities using edge probabilities
     edge_log_probs = torch.log(rectified_edge_probs + eps)
     edge_triples = torch.matmul(matrices.edge_to_triangle, edge_log_probs)
     edge_triplets_log_mean = torch.exp(edge_triples / 3)
-    zero_edges = (rectified_edge_probs == 0) # If any edge is 0, the triangle should be 0
+    zero_edges = (rectified_edge_probs == 0)
     zero_triangles = (matrices.edge_to_triangle @ zero_edges.float()).bool()
-    edge_triplets_log_mean[zero_triangles.squeeze()] = 0
+    edge_triplets_log_mean = torch.where(zero_triangles.squeeze(),
+                                       edge_triplets_log_mean - edge_triplets_log_mean,
+                                       edge_triplets_log_mean)
     rectified_triangle_probs = torch.minimum(triangle_probs, edge_triplets_log_mean)
 
     # Rectify tetrahedron probabilities 
     triangle_log_probs = torch.log(rectified_triangle_probs + eps)
     triangle_quads = torch.matmul(matrices.triangle_to_tetra, triangle_log_probs)
     triangle_quads_log_mean = torch.exp(triangle_quads / 4)
-    zero_triangles = (rectified_triangle_probs == 0) # If any triangle is 0, the tetrahedron should be 0
+    zero_triangles = (rectified_triangle_probs == 0)
     zero_tetra = (matrices.triangle_to_tetra @ zero_triangles.float()).bool()
-    triangle_quads_log_mean[zero_tetra.squeeze()] = 0
+    triangle_quads_log_mean = torch.where(zero_tetra.squeeze(),
+                                        triangle_quads_log_mean - triangle_quads_log_mean,
+                                        triangle_quads_log_mean)
     rectified_tetra_probs = torch.minimum(tetra_probs, triangle_quads_log_mean)
 
     return RectifiedProbs(
@@ -119,8 +127,8 @@ def enforce_constraints(
 def verify_constraints(probs: RectifiedProbs, matrices: ConstraintMatrices) -> None:
     """Verify that the rectified probabilities satisfy the constraints."""
     print("\nVerifying constraints:")
-    # print(f"Vertices: {probs.vertices}")
-    # print(f"Edges: {probs.edges}")
+    print(f"Vertices: {probs.vertices}")
+    print(f"Edges: {probs.edges}")
     # print(f"Triangles: {probs.triangles}")
     # print(f"Tetrahedra: {probs.tetra}")
     
@@ -159,7 +167,7 @@ def main():
     # Set random seed for reproducibility
     torch.manual_seed(42)
     
-    n_vertices = 20
+    n_vertices = 7
     n_edges = len(torch.combinations(torch.tensor(range(n_vertices)), 2))
     print(n_edges)
     n_triangles = len(torch.combinations(torch.tensor(range(n_vertices)), 3))
