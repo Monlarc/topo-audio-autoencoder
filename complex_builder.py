@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 from rectifier import RectifiedProbs
 from rectifier import ConstraintMatrices
+from typing import Dict
 torch.autograd.set_detect_anomaly(True)
 
 
@@ -19,43 +20,69 @@ def dense_to_sparse(dense_tensor: torch.Tensor) -> torch.Tensor:
     values = dense_tensor[indices[0], indices[1]]
     return torch.sparse_coo_tensor(indices, values, dense_tensor.size()).coalesce()
 
-def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices) -> SparseSimplicialMatrices:
-    """Build sparse matrices by first constructing dense then converting to sparse"""
-    n_vertices = len(probs.vertices)
+def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices, active_indices: Dict[str, torch.Tensor]) -> SparseSimplicialMatrices:
+    """Build sparse matrices by selecting active rows and columns."""
+    # Debug prints
+    # print("\nActive indices:")
+    # for rank, indices in active_indices.items():
+    #     print(f"{rank}: {indices.shape}")
     
-    # Build vertex adjacency matrix - ensure we maintain gradients
-    vertex_adjacency = torch.zeros((n_vertices, n_vertices), 
+    if len(active_indices['vertices']) == 0:
+        print("No active vertices!")
+        return None
+        
+    # Build vertex adjacency matrix
+    vertex_adjacency = torch.zeros((len(probs.vertices), len(probs.vertices)), 
                                  device=probs.edges.device, 
                                  dtype=probs.edges.dtype)
     edge_indices = matrices.indices.edges
     vertex_adjacency[edge_indices[:, 0], edge_indices[:, 1]] = probs.edges
-    vertex_adjacency[edge_indices[:, 1], edge_indices[:, 0]] = probs.edges  # Symmetric
+    vertex_adjacency[edge_indices[:, 1], edge_indices[:, 0]] = probs.edges
+    
+    # Debug prints before and after selection
+    # print("\nMatrix shapes before selection:")
+    # print(f"vertex_adjacency: {vertex_adjacency.shape}")
+    
+    # Select active submatrices
+    vertex_adjacency = vertex_adjacency[active_indices['vertices']][:, active_indices['vertices']]
+    
+
     
     # Build incidence matrices
     vertex_edge_incidence = matrices.vertex_to_edge.T * probs.edges.unsqueeze(0)
     edge_triangle_incidence = matrices.edge_to_triangle.T * probs.triangles.unsqueeze(0)
     triangle_tetra_incidence = matrices.triangle_to_tetra.T * probs.tetra.unsqueeze(0)
     
-    # Build higher-order adjacencies with gradient-preserving operations
+    # Select active rows and columns for incidence matrices
+    vertex_edge_incidence = vertex_edge_incidence[active_indices['vertices']][:, active_indices['edges']]
+    edge_triangle_incidence = edge_triangle_incidence[active_indices['edges']][:, active_indices['triangles']]
+    triangle_tetra_incidence = triangle_tetra_incidence[active_indices['triangles']][:, active_indices['tetra']]
+    
+    # Build higher-order adjacencies
     edge_adjacency = edge_triangle_incidence @ edge_triangle_incidence.t()
-    eye = torch.eye(edge_adjacency.shape[0], device=edge_adjacency.device)
-    edge_adjacency = edge_adjacency - eye * edge_adjacency
-    
     triangle_adjacency = triangle_tetra_incidence @ triangle_tetra_incidence.t()
-    eye = torch.eye(triangle_adjacency.shape[0], device=triangle_adjacency.device)
-    triangle_adjacency = triangle_adjacency - eye * triangle_adjacency
+    tetra_adjacency = triangle_tetra_incidence.t() @ triangle_tetra_incidence
     
-    tetrahedra_adjacency = triangle_tetra_incidence.t() @ triangle_tetra_incidence
-    eye = torch.eye(tetrahedra_adjacency.shape[0], device=tetrahedra_adjacency.device)
-    tetrahedra_adjacency = tetrahedra_adjacency - eye * tetrahedra_adjacency
+    # Remove self-loops without using in-place operations
+    eye = torch.eye
+    edge_adjacency = edge_adjacency * (1 - eye(len(active_indices['edges']), device=edge_adjacency.device))
+    triangle_adjacency = triangle_adjacency * (1 - eye(len(active_indices['triangles']), device=triangle_adjacency.device))
+    tetra_adjacency = tetra_adjacency * (1 - eye(len(active_indices['tetra']), device=tetra_adjacency.device))
+
+    # print("\nMatrix shapes after selection:")
+    # print(f"vertex_adjacency: {vertex_adjacency.shape}")
+    # print(f"edge_adjacency: {edge_adjacency.shape}")
+    # print(f"triangle_adjacency: {triangle_adjacency.shape}")
+    # print(f"tetra_adjacency: {tetra_adjacency.shape}")
+
+    # print("vertex_edge_incidence:", vertex_edge_incidence.shape)
+    # print("edge_triangle_incidence:", edge_triangle_incidence.shape)
+    # print("triangle_tetra_incidence:", triangle_tetra_incidence.shape)
     
-    # Modified sparse conversion to ensure gradient flow
-    def to_sparse_with_gradients(dense_tensor):
-        indices = torch.nonzero(dense_tensor).t()
-        values = dense_tensor[indices[0], indices[1]]
-        sparse = torch.sparse_coo_tensor(indices, values, dense_tensor.size())
-        # Force coalescing to ensure consistent gradient flow
-        return sparse.coalesce()
+    def to_sparse(dense):
+        indices = torch.nonzero(dense).t()
+        values = dense[indices[0], indices[1]]
+        return torch.sparse_coo_tensor(indices, values, dense.size()).coalesce()
     
     def register_grad_hook(tensor, name, scale_factor=10.0):
         if tensor.requires_grad:
@@ -68,22 +95,22 @@ def build_sparse_matrices(probs: RectifiedProbs, matrices: ConstraintMatrices) -
 
     complex_matrices = SparseSimplicialMatrices(
         adjacencies={
-            'rank_0': to_sparse_with_gradients(vertex_adjacency),
-            'rank_1': to_sparse_with_gradients(edge_adjacency),
-            'rank_2': to_sparse_with_gradients(triangle_adjacency),
-            'rank_3': to_sparse_with_gradients(tetrahedra_adjacency)
+            'rank_0': to_sparse(vertex_adjacency),
+            'rank_1': to_sparse(edge_adjacency),
+            'rank_2': to_sparse(triangle_adjacency),
+            'rank_3': to_sparse(tetra_adjacency)
         },
         incidences={
-            'rank_1': to_sparse_with_gradients(vertex_edge_incidence),
-            'rank_2': to_sparse_with_gradients(edge_triangle_incidence),
-            'rank_3': to_sparse_with_gradients(triangle_tetra_incidence)
+            'rank_1': to_sparse(vertex_edge_incidence),
+            'rank_2': to_sparse(edge_triangle_incidence),
+            'rank_3': to_sparse(triangle_tetra_incidence)
         }
     )
 
-    for rank, matrix in complex_matrices.adjacencies.items():
-        register_grad_hook(matrix, f"Adjacency matrix {rank}")
-    for rank, matrix in complex_matrices.incidences.items():
-        register_grad_hook(matrix, f"Incidence matrix {rank}")
+    # for rank, matrix in complex_matrices.adjacencies.items():
+    #     register_grad_hook(matrix, f"Adjacency matrix {rank}")
+    # for rank, matrix in complex_matrices.incidences.items():
+    #     register_grad_hook(matrix, f"Incidence matrix {rank}")
 
     return complex_matrices
 

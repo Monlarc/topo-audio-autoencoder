@@ -70,6 +70,7 @@ class RectifiedProbs:
     edges: torch.Tensor
     triangles: torch.Tensor
     tetra: torch.Tensor
+    all_simplices: torch.Tensor
 
 def enforce_constraints(
     vertex_probs: torch.Tensor,
@@ -121,7 +122,8 @@ def enforce_constraints(
         vertices=vertex_probs,
         edges=rectified_edge_probs,
         triangles=rectified_triangle_probs,
-        tetra=rectified_tetra_probs
+        tetra=rectified_tetra_probs,
+        all_simplices=torch.cat([vertex_probs, rectified_edge_probs, rectified_triangle_probs, rectified_tetra_probs])
     )
 
 def verify_constraints(probs: RectifiedProbs, matrices: ConstraintMatrices) -> None:

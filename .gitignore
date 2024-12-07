@@ -3,6 +3,8 @@ __pycache__/
 
 # Ignore checkpoint files
 checkpoints/
+checkpoints_old/
+precomputed/
 
 # Ignore audio samples
 AudioTensors/

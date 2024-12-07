@@ -23,29 +23,34 @@ def set_seeds(seed):
     g.manual_seed(seed)
     return g
 
-class GumbelBernoulli(nn.Module):
-    def __init__(self, start_temp=5.0, min_temp=0.1):
+class BinaryGumbel(nn.Module):
+    def __init__(self, start_temp=1.0, min_temp=0.01):
         super().__init__()
         self.start_temp = start_temp
         self.min_temp = min_temp
         self.current_temp = start_temp
         
     def forward(self, logits):
+        logits_pair = torch.stack([logits, 1 - logits])
         if self.training:
-            gumbels = -torch.empty_like(logits).exponential_().log()
-            gumbels = (logits + gumbels) / self.current_temp
-            y_soft = F.softplus(gumbels) / (F.softplus(gumbels) + F.softplus(-gumbels))
-            
-            # Sample from Bernoulli
-            y_hard = torch.bernoulli(y_soft)
-            
-            return y_soft + (y_hard - y_soft).detach()
+            gumbels = -torch.empty_like(logits_pair).exponential_().log()
+            gumbel_logits = (logits_pair + gumbels) / self.current_temp
+
+            probs = F.softmax(gumbel_logits, dim=0)[0]
+
+            return probs
+        
         else:
             logits = logits / self.current_temp
-            return (F.softplus(logits) / (F.softplus(logits) + F.softplus(-logits)) > 0.5).float()
-
+            probs = F.softmax(logits, dim=0)[0]
+                
+            return (probs > 0.5).float()
+            
     def set_temperature(self, temp):
-        self.current_temp = temp
+        if temp < self.min_temp:
+            self.current_temp = self.min_temp
+        else:
+            self.current_temp = temp
 
 
 class FrequencyBandModule(nn.Module):
@@ -53,10 +58,10 @@ class FrequencyBandModule(nn.Module):
         super().__init__()
         self.band_conv = nn.Sequential(
             nn.Conv1d(in_channels, hidden_channels, kernel_size=15, stride=2, padding=7),
-            nn.BatchNorm1d(hidden_channels),
+            nn.InstanceNorm1d(hidden_channels),
             nn.LeakyReLU(),
             nn.Conv1d(hidden_channels, out_channels, kernel_size=15, stride=2, padding=7),
-            nn.BatchNorm1d(out_channels),
+            nn.InstanceNorm1d(out_channels),
             nn.LeakyReLU()
         )
 
@@ -65,240 +70,377 @@ class FrequencyBandModule(nn.Module):
     
 
 class AudioEncoder(nn.Module):
-    def __init__(self, num_vertices, num_bands=16, embedding_dim=128, dropout=0.1):
+    def __init__(
+            self, 
+            num_vertices,
+            num_bands=16, 
+            embedding_dim=128, 
+            dropout=0.1,
+            min_active_vertices=8, 
+            max_active_vertices=16, 
+            temp=5.0, 
+            min_temp=0.1,
+            hard=False
+        ):
         super().__init__()
         self.num_vertices = num_vertices
         self.num_edges = math.comb(self.num_vertices, 2)
         self.num_triangles = math.comb(self.num_vertices, 3)
         self.num_tetra = math.comb(self.num_vertices, 4)
         self.total_simplices = self.num_vertices + self.num_edges + self.num_triangles + self.num_tetra
-        # self.sc = SimplicialComplex()
         self.seed = 511990
         self.embedding_dim = embedding_dim
-
-        # Vertex embeddings
-        self.vertex_embeddings = nn.Embedding(num_vertices, embedding_dim)
-
-        # Linear layers for projecting embeddings
-        self.edge_projection = nn.Linear(2 * embedding_dim, embedding_dim)
-        self.triangle_projection = nn.Linear(3 * embedding_dim, embedding_dim)
-        self.tetra_projection = nn.Linear(4 * embedding_dim, embedding_dim)
-
-        # Create constraint matrices for rectification
+        self.min_active_vertices = min_active_vertices
+        self.max_active_vertices = max_active_vertices
+        self.num_bands = num_bands
         self.constraints = ConstraintMatrices.create(num_vertices)
-        
-        # Process each frequency band independently
+        self.active_simplices = None
+        self.hard = hard
+
+        if hard:
+            self.gumbel = BinaryGumbel(start_temp=1.0, min_temp=0.01)
+
+        # Process each frequency band with progressive dimension changes
         self.band_processors = nn.ModuleList([
-            FrequencyBandModule(in_channels=1, out_channels=16) 
-            for _ in range(num_bands)
+            nn.Sequential(
+                # Initial feature extraction
+                nn.Conv1d(1, 8, kernel_size=15, stride=2, padding=7),
+                nn.GroupNorm(2, 8),
+                nn.GELU(),
+                # First temporal reduction
+                nn.Conv1d(8, 16, kernel_size=7, stride=2, padding=3),
+                nn.GroupNorm(4, 16),
+                nn.GELU(),
+                # Second temporal reduction
+                nn.Conv1d(16, 16, kernel_size=5, stride=2, padding=2),
+                nn.GroupNorm(4, 16),
+                nn.GELU(),
+            ) for _ in range(num_bands)
         ])
 
+        # Simple skip connection with matched dimensions
+        self.skip_maxpool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.skip_weight = nn.Parameter(torch.tensor(0.1))  # Learnable weight for skip connection
+
+        # Cross-band processing with matching temporal reduction
         self.cross_band = nn.Sequential(
-            nn.Conv1d(16 * num_bands, 256, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(),
-            nn.Conv1d(256, 128, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU()
+            # First merge: 256 -> 192
+            nn.Conv1d(num_bands * 16, 192, kernel_size=5, padding=2, groups=4),
+            nn.GroupNorm(12, 192),
+            nn.GELU(),
+            # Second merge: 192 -> 128
+            nn.Conv1d(192, 128, kernel_size=7, padding=3),
+            nn.GroupNorm(8, 128),
+            nn.GELU()
         )
 
-        post_temporal_reduction = 64
+        # Progressive temporal reduction
         self.temporal_reduction = nn.Sequential(
-            nn.Conv1d(128, 128, kernel_size=7, stride=4, padding=3),
-            nn.LeakyReLU(),
-            nn.Conv1d(128, 128, kernel_size=7, stride=4, padding=3),
-            nn.LeakyReLU(),
-            nn.AdaptiveAvgPool1d(output_size=post_temporal_reduction)
+            nn.Conv1d(128, 128, kernel_size=7, stride=4, padding=3, groups=8),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            nn.Conv1d(128, 128, kernel_size=7, stride=2, padding=3, groups=8),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            # Final reduction
+            nn.Conv1d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
         )
 
-        self.mlp = nn.Sequential(
-            nn.Linear(128 * post_temporal_reduction, 1024),  # 128 channels * 32 temporal positions
-            nn.LeakyReLU(),
+        # Progressive MLP with residual connections
+        self.to_simplices = nn.Sequential(
+            # First reduction
+            nn.Linear(4096, 2048),
+            nn.LayerNorm(2048),
+            nn.GELU(),
             nn.Dropout(dropout),
+            # Second reduction
+            nn.Linear(2048, 1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # Final projection
             nn.Linear(1024, self.total_simplices)
         )
-        
-        # Replace Hard Concrete with Gumbel-Bernoulli
-        self.gumbel = GumbelBernoulli()
-        self.mlp_output = None
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        # Process each frequency band independently
-        band_features = []
-        for i, band_processor in enumerate(self.band_processors):
-            band = x[:, i:i+1]
-            processed = band_processor(band)
-            band_features.append(processed)
-        x = torch.cat(band_features, dim=1)
-        x = self.dropout(x)
+        self.vertex_bias = nn.Parameter(torch.ones(1) * 2.0)
+        self.edge_bias = nn.Parameter(torch.ones(1))
+        self.triangle_bias = nn.Parameter(torch.ones(1))
+        self.tetra_bias = nn.Parameter(torch.ones(1) * 1.5)
         
-        # Cross-band integration and temporal reduction
-        x = self.cross_band(x)
-        # x = self.dropout(x)
-        x = self.temporal_reduction(x)
-        x = x.flatten(1)
-        # x = self.dropout(x)
-        logits = self.mlp(x).squeeze(0)
+        self.gumbel = BinaryGumbel()
+        self.dropout = nn.Dropout(dropout)
+        self.temp = temp
+        self.min_temp = min_temp
+
+        self.vertex_embeddings = nn.Sequential(
+            nn.Embedding(num_vertices, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
         
-        # Add bias to vertex logits to encourage some active vertices
-        vertex_logits = logits[:self.num_vertices] + 5.0  # Bias towards active vertices
-        edge_logits = logits[self.num_vertices:self.num_vertices + self.num_edges]
-        triangle_logits = logits[self.num_vertices + self.num_edges:
-                                self.num_vertices + self.num_edges + self.num_triangles]
-        tetra_logits = logits[-self.num_tetra:]
+        self.edge_embeddings = nn.Sequential(
+            nn.Embedding(self.num_edges, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
         
-        # Apply Gumbel-Bernoulli to each set
-        # while True:
-        #     vertex_probs = self.gumbel(vertex_logits)
-        #     if torch.sum(vertex_probs) > 2:
-        #         break
-        #     vertex_logits = vertex_logits + torch.randn_like(vertex_logits)
-        vertex_probs = self.gumbel(vertex_logits) 
-        edge_probs = self.gumbel(edge_logits)
-        triangle_probs = self.gumbel(triangle_logits)
-        tetra_probs = self.gumbel(tetra_logits)
+        self.triangle_embeddings = nn.Sequential(
+            nn.Embedding(self.num_triangles, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
         
-        # Build simplicial complex
+        self.tetra_embeddings = nn.Sequential(
+            nn.Embedding(self.num_tetra, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+
+        self.constraints = ConstraintMatrices.create(num_vertices)
+
+    def compute_vertex_penalty(self, vertex_probs):
+        vertex_count = vertex_probs.sum()
+        vertex_penalty = F.relu(self.min_active_vertices - vertex_count) + \
+                        F.relu(vertex_count - self.max_active_vertices)
+        return vertex_penalty
+    
+    def compute_entropy_loss(self, vertex_probs, edge_probs, triangle_probs, tetra_probs):
+        # Compute average activation for each simplex type
+        vertex_activation = vertex_probs.mean()
+        edge_activation = edge_probs.mean()
+        triangle_activation = triangle_probs.mean()
+        tetra_activation = tetra_probs.mean()
+        
+        # Compute entropy across simplex types to encourage diversity
+        probs = torch.stack([
+            vertex_activation, edge_activation,
+            triangle_activation, tetra_activation
+        ])
+        # Normalize to create a proper probability distribution
+        probs = probs / (probs.sum() + 1e-10)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+        # Negate entropy since we want to minimize the loss
+        entropy_loss = -0.1 * entropy
+
+        torch.stack([vertex_probs, edge_probs, triangle_probs, tetra_probs])
+
+        return entropy_loss
+
+    def get_active_simplex_embeddings(self, vertices, edges, triangles, tetra, device):
+        """Get embeddings only for active simplices."""
+        # Get indices of active simplices
+        active_vertices = vertices.nonzero().squeeze(-1)
+        active_edges =  edges.nonzero().squeeze(-1)
+        active_triangles =  triangles.nonzero().squeeze(-1)
+        active_tetra =  tetra.nonzero().squeeze(-1)
+
+        print("\nActive simplex counts:")
+        print(f"Vertices: {len(active_vertices)}")
+        print(f"Edges: {len(active_edges)}")
+        print(f"Triangles: {len(active_triangles)}")
+        print(f"Tetrahedra: {len(active_tetra)}")
+
+        # Get embeddings only for active simplices
+        def get_embedding(embedding_layer, active_indices, probs):
+            embeddings = embedding_layer(active_indices)
+            probs_expanded = probs[active_indices].unsqueeze(-1)
+            result = embeddings * probs_expanded
+            # print(f"Embedding shape: {result.shape}")
+            return result
+
+        embeddings = {
+            'rank_0': get_embedding(self.vertex_embeddings, active_vertices, vertices),
+            'rank_1': get_embedding(self.edge_embeddings, active_edges, edges),
+            'rank_2': get_embedding(self.triangle_embeddings, active_triangles, triangles),
+            'rank_3': get_embedding(self.tetra_embeddings, active_tetra, tetra)
+        }
+
+        embeddings['active_indices'] = {
+            'vertices': active_vertices,
+            'edges': active_edges,
+            'triangles': active_triangles,
+            'tetra': active_tetra
+        }
+
+        return embeddings
+
+    def build_sparse_complex_matrices(self, rectified):
+        """Build sparse matrices only for active simplices."""
+        active_vertices = rectified.vertices.nonzero().squeeze(-1)
+        
+        # If no vertices are active, return None
+        if len(active_vertices) == 0:
+            return None
+
+        # Get the subset of constraint matrices for active vertices
+        active_edges = rectified.edges.nonzero().squeeze(-1)
+        active_triangles = rectified.triangles.nonzero().squeeze(-1)
+        active_tetra = rectified.tetra.nonzero().squeeze(-1)
+
+        # Create sparse matrices only for active simplices
+        matrices = {
+            'vertices': rectified.vertices,
+            'edges': rectified.edges,
+            'triangles': rectified.triangles,
+            'tetra': rectified.tetra,
+            'boundary_1': self.constraints.boundary_1[active_edges][:, active_vertices] if len(active_edges) > 0 else None,
+            'boundary_2': self.constraints.boundary_2[active_triangles][:, active_edges] if len(active_triangles) > 0 else None,
+            'boundary_3': self.constraints.boundary_3[active_tetra][:, active_triangles] if len(active_tetra) > 0 else None
+        }
+
+        return matrices
+    
+    def split_simplices(self, logits):
+        vertices = logits[:self.num_vertices] + F.relu(self.vertex_bias)
+        edges = logits[self.num_vertices:self.num_vertices + self.num_edges]
+        triangles = logits[self.num_vertices + self.num_edges:self.num_vertices + self.num_edges + self.num_triangles]
+        tetrahedra = logits[-self.num_tetra:]
+
+        return vertices, edges, triangles, tetrahedra
+
+    def compute_contrastive_loss(self, logits, function='InfoNCE', temperature=0.1):
+        if function == 'InfoNCE':
+            # Normalize embeddings
+            anchor = F.normalize(logits[0], dim=1)
+            positive = F.normalize(logits[1], dim=1)
+            negatives = F.normalize(logits[2:], dim=1)
+            
+            # Compute logits
+            logits_pos = torch.einsum('nc,nc->n', [anchor, positive])
+            logits_neg = torch.einsum('nc,nkc->nk', [anchor, negatives])
+            
+            # Concatenate logits and compute loss
+            logits = torch.cat([logits_pos.unsqueeze(-1), logits_neg], dim=1)
+            labels = torch.zeros(logits.shape[0], dtype=torch.long, device=anchor.device)
+            
+            return F.cross_entropy(logits / temperature, labels)
+        
+        elif function == 'Triplet':
+            anchor = logits[0]
+            positive = logits[1]
+            negative = logits[2]
+            return F.triplet_margin_with_distance_loss(anchor, positive, negative)
+        else:
+            raise ValueError(f"{function} is not a valid contrastive loss function")
+
+    def generate_complex(self, logits):
+        logits = logits[:self.num_vertices] + F.relu(self.vertex_bias)
+        if not self.hard:
+            simplex_probs = self.gumbel(logits)
+            vertex_loss = 0
+
+        else:
+            simplex_probs = F.sigmoid(logits / self.temp)
+        
+        vertex_probs, edge_probs, triangle_probs, tetra_probs = self.split_simplices(simplex_probs)
+
         rectified = enforce_constraints(
             vertex_probs, edge_probs, triangle_probs, tetra_probs, self.constraints
         )
 
-        # print(f"rectified.vertices: {rectified.vertices}")
-        if torch.sum(rectified.vertices) == 0:
-            # print(f"rectified.vertices: {rectified.vertices}")
-            # print("Warning: No simplices found in rectified complex")
+        # entropy_loss = self.compute_entropy_loss(rectified.vertices, rectified.edges, rectified.triangles, rectified.tetra)
+
+        if self.hard:
+            vertices = torch.bernoulli(rectified.vertices)
+            edges = torch.bernoulli(rectified.edges)
+            triangles = torch.bernoulli(rectified.triangles)
+            tetrahedra = torch.bernoulli(rectified.tetra)
+
+            rectified2 = enforce_constraints(
+                vertices, edges, triangles, tetrahedra, self.constraints
+            )
+
+            # vertex_loss = self.compute_vertex_penalty(rectified.vertices)
+            vertex_logits, edge_logits, triangle_logits, tetra_logits = self.split_simplices(logits)
+
+            vertices = vertex_logits + (rectified2.vertices - vertex_logits).detach()
+            edges = edge_logits + (rectified2.edges - edge_logits).detach()
+            triangles = triangle_logits + (rectified2.triangles - triangle_logits).detach()
+            tetrahedra = tetra_logits + (rectified2.tetra - tetra_logits).detach()
+
+        else:
+            vertices = rectified.vertices
+            edges = rectified.edges
+            triangles = rectified.triangles
+            tetrahedra = rectified.tetra
+
+        if torch.sum(vertices) == 0:
             return None, None, None
         
-        print(f"Number of vertices: {len(rectified.vertices.nonzero())}")
-        print(f"Number of edges: {len(rectified.edges.nonzero())}")
-        print(f"Number of triangles: {len(rectified.triangles.nonzero())}")
-        print(f"Number of tetrahedra: {len(rectified.tetra.nonzero())}")
-        
-        # Faster vectorized implementation of entropy loss
-        all_probs = torch.cat([rectified.vertices, rectified.edges, rectified.triangles, rectified.tetra])
-        entropy_loss = -(all_probs * torch.log(all_probs + 1e-10) + 
-                        (1 - all_probs) * torch.log(1 - all_probs + 1e-10)).mean()
-        
-        self.complex_matrices = build_sparse_matrices(rectified, self.constraints)
-        
-        # Generate embeddings
-        vertex_indices = torch.arange(self.num_vertices, device=x.device)
-        vertex_embeds = self.vertex_embeddings(vertex_indices)
-        
-        edge_indices = self.constraints.indices.edges
-        triangle_indices = self.constraints.indices.triangles
-        tetra_indices = self.constraints.indices.tetra
-        
-        edge_embeds = self.edge_projection(vertex_embeds[edge_indices].view(-1, 2 * self.embedding_dim))
-        triangle_embeds = self.triangle_projection(edge_embeds[triangle_indices].view(-1, 3 * self.embedding_dim))
-        tetra_embeds = self.tetra_projection(triangle_embeds[tetra_indices].view(-1, 4 * self.embedding_dim))
-        
+        # diversity_loss = {
+        #     'binary_entropy': entropy_loss,
+        #     'diversity': vertex_loss
+        # }
+
+        active_embeddings = self.get_active_simplex_embeddings(vertices, edges, triangles, tetrahedra, logits.device)
+
+        self.active_simplices = active_embeddings['active_indices']
+
         embeddings = {
-            'rank_0': vertex_embeds,
-            'rank_1': edge_embeds,
-            'rank_2': triangle_embeds,
-            'rank_3': tetra_embeds
+            'rank_0': active_embeddings['rank_0'],
+            'rank_1': active_embeddings['rank_1'],
+            'rank_2': active_embeddings['rank_2'],
+            'rank_3': active_embeddings['rank_3']
         }
-        
-        self.mlp_output = logits
-        
-        return embeddings, self.complex_matrices, entropy_loss
 
-    def count_parameters(self):
-        """Count and print parameters for each component of the model"""
-        
-        # FrequencyBandModule params (per band)
-        band_params = sum(p.numel() for p in self.band_processors[0].parameters())
-        total_band_params = band_params * len(self.band_processors)
-        
-        # Cross-band params
-        cross_band_params = sum(p.numel() for p in self.cross_band.parameters())
-        
-        # Temporal reduction params
-        temporal_params = sum(p.numel() for p in self.temporal_reduction.parameters())
-        
-        # MLP params
-        mlp_params = sum(p.numel() for p in self.mlp.parameters())
-        
-        # Gumbel-Bernoulli params
-        gumbel_params = sum(p.numel() for p in self.gumbel.parameters())
-        
-        print("\nParameter Count Breakdown:")
-        print(f"Frequency Band Processors: {total_band_params:,} params")
-        print(f"  (Per band: {band_params:,} params × {len(self.band_processors)} bands)")
-        print(f"Cross-band Integration: {cross_band_params:,} params")
-        print(f"Temporal Reduction: {temporal_params:,} params")
-        print(f"MLP: {mlp_params:,} params")
-        print(f"Gumbel-Bernoulli: {gumbel_params:,} params")
-        print(f"Total: {self.num_params():,} params")
-        
-        # Detailed breakdown of a single FrequencyBandModule
-        print("\nFrequencyBandModule Breakdown:")
-        for name, param in self.band_processors[0].named_parameters():
-            print(f"{name}: {param.numel():,} params")
-        
-        # Detailed breakdown of MLP
-        print("\nMLP Breakdown:")
-        for name, param in self.mlp.named_parameters():
-            print(f"{name}: {param.numel():,} params")
+        complex_matrices = build_sparse_matrices(rectified, self.constraints, active_embeddings['active_indices'])
 
-    def num_params(self):
-        """Return total number of trainable parameters"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-    def get_last_layer_output(self):
-        return self.mlp_output
+        embeddings = self.get_active_simplex_embeddings(vertices, edges, triangles, tetrahedra, logits.device)
 
-def test_hard_concrete():
-    # Create logits with a distribution more like what the network might output
-    logits = torch.randn(1000) * 2  # Normal distribution with std=2
-    print(f"\nLogits stats:")
-    print(f"Mean: {logits.mean():.3f}")
-    print(f"Std: {logits.std():.3f}")
-    print(f"Min: {logits.min():.3f}")
-    print(f"Max: {logits.max():.3f}")
+        return embeddings, complex_matrices
 
-    # Test different biases through sigmoid
-    print("\nJust sigmoid with different biases:")
-    for bias in [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0]:
-        probs = torch.sigmoid(logits + bias)
-        print(f"Bias {bias:4.1f}: avg prob = {probs.mean():.3f}")
+    def forward(self, x):
+        # print("\nEncoder Forward Pass Shapes:")
+        # print(f"Input shape: {x.shape}")  # Should be [batch, bands, time]
+        
+        # Process each frequency band independently
+        band_features = []
+        for i, band_processor in enumerate(self.band_processors):
+            band = x[:, i:i+1]
+            # print(f"Single band {i} shape: {band.shape}")
+            processed = band_processor(band)
+            # print(f"Processed band {i} shape: {processed.shape}")
+            band_features.append(processed)
+        
+        # Concatenate band features
+        x = torch.cat(band_features, dim=1)
+        # print(f"After concatenating all bands: {x.shape}")
+        
+        # Create skip connection with matched dimensions
+        skip = self.skip_maxpool(x.transpose(1, 2)).transpose(1, 2)
+        # print(f"Skip connection shape: {skip.shape}")
+        
+        # Cross-band processing
+        x = self.cross_band(x)
+        # print(f"After cross-band processing: {x.shape}")
+        
+        # Add skip connection with learnable weight
+        x = x + self.skip_weight * skip
+        # print(f"After adding skip connection: {x.shape}")
+        
+        # Temporal reduction
+        x = self.temporal_reduction(x)
+        # print(f"After temporal reduction: {x.shape}")
+        
+        # Flatten and process through MLP
+        x = x.flatten(1)
+        # print(f"After flattening: {x.shape}")
+        logits = self.to_simplices(x).squeeze()
 
-    # Test full Hard Concrete
-    print("\nFull Hard Concrete distribution:")
-    hc = HardConcrete(
-        beta=1.0,
-        init_gamma=-1.0,
-        init_zeta=1.1,
-        loc_bias=0.0
-    )
-    
-    # Test in training mode (with noise)
-    hc.train()
-    print("\nTraining mode (with noise):")
-    for _ in range(5):  # Multiple runs to see variance
-        out = hc(logits)
-        zeros = (out == 0.0).float().mean()
-        ones = (out == 1.0).float().mean()
-        middle = ((out > 0.0) & (out < 1.0)).float().mean()
-        print(f"Run {_+1}:")
-        print(f"  Zeros: {zeros:.3f}")
-        print(f"  Ones: {ones:.3f}")
-        print(f"  In (0,1): {middle:.3f}")
-        print(f"  Mean: {out.mean():.3f}")
+        # Add contrastive loss while training
+        contrastive_loss = None
+        if self.training:
+            contrastive_loss = self.compute_contrastive_loss(logits), contrastive_loss
 
-    # Test in eval mode (deterministic)
-    hc.eval()
-    print("\nEval mode (no noise):")
-    out = hc(logits)
-    zeros = (out == 0.0).float().mean()
-    ones = (out == 1.0).float().mean()
-    middle = ((out > 0.0) & (out < 1.0)).float().mean()
-    print(f"Zeros: {zeros:.3f}")
-    print(f"Ones: {ones:.3f}")
-    print(f"In (0,1): {middle:.3f}")
-    print(f"Mean: {out.mean():.3f}")
+        return self.generate_complex(logits), contrastive_loss
+
+class ScaleLayer(nn.Module):
+    def __init__(self, scale_factor):
+        super().__init__()
+        self.scale_factor = scale_factor
+        
+    def forward(self, x):
+        return x * self.scale_factor
+
+
 
 def test_simple_complex():
     # Define 6 vertices
@@ -360,4 +502,4 @@ if __name__ == "__main__":
     # model = AudioEncoder(num_vertices=20)
     # model.count_parameters()
     # test_simple_complex()
-    test_hard_concrete()
+    ...
